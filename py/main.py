@@ -6,7 +6,7 @@ from enum import Enum
 
 CRSF_SYNC = 0xC8
 PACKET_LENGTH = 24
-COMPORT = "COM10"
+COMPORT = "/dev/ttyUSB0"
 BAUDRATE = 921600
 CHANNEL_LENGTH = 11
 CHANNELS_NUM = 16
@@ -160,15 +160,61 @@ def handle_CRSF_packet(ptype, data):
 
 def main():
     with serial.Serial(COMPORT, BAUDRATE, timeout=2) as ser:
+        ch0 = [992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
+        ch1 = [992, 1100, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
+        ch2 = [1200, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
+        ch3 = [800, 800, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
+
         input = bytearray()
+        timer = 0
+        state = 0
+        ch = ch0
+
+        ser.write(channels_CRSF_to_packet(ch0))
+
         while True:
             if ser.in_waiting > 0:
                 input.extend(ser.read(ser.in_waiting))
             else:
                 # Sending CHANNELS_PACKED every 20ms (all channels 1500us).
-                ser.write(
-                    channels_CRSF_to_packet([992 for ch in range(CHANNELS_NUM)])
-                )
+                # ser.write(
+                #     channels_CRSF_to_packet([992 for ch in range(CHANNELS_NUM)])
+                # )
+
+                ser.write(channels_CRSF_to_packet(ch))
+
+                if state == 0:
+                    if timer == 30:
+                        ch = ch1
+                        timer = 0
+                        state = 1
+                    timer += 1
+                if state == 1:
+                    if timer == 1000:
+                        ch = ch2
+                        timer = 0
+                        state = 2
+                    timer += 1
+                # if state == 1:
+                #     if not timer % 500:
+                #         ser.write(channels_CRSF_to_packet(ch2))
+                #         timer = 0
+                #         state = 2
+                #     else:
+                #         timer += 1
+                # if state == 2:
+                #     if not timer % 1000:
+                #         ser.write(channels_CRSF_to_packet(ch3))
+                #         timer = 0
+                #         state = 0
+                #     else:
+                #         timer += 1
+                # time.sleep(10)
+                # time.sleep(20)
+                # ser.write(channels_CRSF_to_packet(ch2))
+                # time.sleep(10)
+                # ser.write(channels_CRSF_to_packet(ch3))
+                # time.sleep(20)
                 time.sleep(0.020)
 
             if len(input) > 2:

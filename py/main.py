@@ -1,238 +1,348 @@
-import serial
-import time
-from enum import Enum
+import struct
+import array
+import asyncio
+
+from fcntl import ioctl
+
+from typing import AsyncGenerator
+from contextlib import asynccontextmanager
+
+import cv2
+import uvicorn
+import aiofiles
+import aioserial
+
+from ultralytics import YOLO
+from fastapi import FastAPI, Response
+from fastapi.responses import StreamingResponse
+
+from crsf import channels_CRSF_to_packet
 
 
-CRSF_SYNC = 0xC8
-PACKET_LENGTH = 24
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SCALE = 1
+COLOR = (255, 0, 0)
+THICKNESS = 2
+
+CHANNEL_MIN = 1
+CHANNEL_CENTER = 992
+CHANNEL_MAX = 1984
+
+JOYSTICK_PATH = "/dev/input/js0"
+AXIS_MIN = -32768
+AXIS_MAX = 32767
+
 COMPORT = "/dev/ttyUSB0"
 BAUDRATE = 921600
-CHANNEL_LENGTH = 11
-CHANNELS_NUM = 16
+
+HOST = "0.0.0.0"
+PORT = 8888
 
 
-class PacketsTypes(int, Enum):
-    GPS = 0x02
-    VARIO = 0x07
-    BATTERY_SENSOR = 0x08
-    BARO_ALT = 0x09
-    HEARTBEAT = 0x0B
-    VIDEO_TRANSMITTER = 0x0F
-    LINK_STATISTICS = 0x14
-    RC_CHANNELS_PACKED = 0x16
-    ATTITUDE = 0x1E
-    FLIGHT_MODE = 0x21
-    DEVICE_INFO = 0x29
-    CONFIG_READ = 0x2C
-    CONFIG_WRITE = 0x2D
-    RADIO_ID = 0x3A
+queue_screen = asyncio.Queue(1)
+queue_uart = asyncio.Queue()
+model = YOLO("yolo-Weights/yolov8n.pt")
+
+class_names = [
+    "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag",
+    "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon",
+    "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", 
+    "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed",
+    "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote",
+    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush"
+]
+
+axis_names = {
+    0x00 : "x",
+    0x01 : "y",
+    0x02 : "z",
+    0x03 : "rx",
+    0x04 : "ry",
+    0x05 : "rz",
+    0x06 : "throttle",
+    0x07 : "rudder",
+    0x08 : "wheel",
+    0x09 : "gas",
+    0x0a : "brake",
+    0x10 : "hat0x",
+    0x11 : "hat0y",
+    0x12 : "hat1x",
+    0x13 : "hat1y",
+    0x14 : "hat2x",
+    0x15 : "hat2y",
+    0x16 : "hat3x",
+    0x17 : "hat3y",
+    0x18 : "pressure",
+    0x19 : "distance",
+    0x1a : "tilt_x",
+    0x1b : "tilt_y",
+    0x1c : "tool_width",
+    0x20 : "volume",
+    0x28 : "misc",
+}
 
 
-def crc8_dvb_s2(crc, a) -> int:
-  crc = crc ^ a
-  for ii in range(8):
-    if crc & 0x80:
-      crc = (crc << 1) ^ 0xD5
-    else:
-      crc = crc << 1
-  return crc & 0xFF
-
-
-def crc8_data(data) -> int:
-    crc = 0
-    for a in data:
-        crc = crc8_dvb_s2(crc, a)
-    return crc
-
-
-def crsf_validate_frame(frame) -> bool:
-    return crc8_data(frame[2:-1]) == frame[-1]
-
-
-def signed_byte(b):
-    return b - 256 if b >= 128 else b
-
-
-def pack_CRSF_to_bytes(channels) -> bytes:
-    # Channels is in CRSF format! (0-1984)
-    # Values are packed little-endianish
-    # such that bits BA987654321 -> 87654321, 00000BA9
-    # 11 bits per channel x 16 channels = 22 bytes
-    if len(channels) != CHANNELS_NUM:
-        raise ValueError(f"CRSF must have {CHANNELS_NUM} channels")
+def map_range(x, in_min, in_max, out_min, out_max):
+    return int((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
     
-    result = bytearray()
-    dest_shift = 0
-    new_value = 0
-    for ch in channels:
-        # Put the low bits in any remaining dest capacity.
-        new_value |= (ch << dest_shift) & 0xff
-        result.append(new_value)
 
-        # Shift the high bits down and place them into the next dest byte.
-        src_bits_left = CHANNEL_LENGTH - 8 + dest_shift
-        new_value = ch >> (CHANNEL_LENGTH - src_bits_left)
-        # When there's at least a full byte remaining, consume that as well.
-        if src_bits_left >= 8:
-            result.append(new_value & 0xff)
-            new_value >>= 8
-            src_bits_left -= 8
-
-        # Next dest should be shifted up by the bits consumed.
-        dest_shift = src_bits_left
-
-    return result
-
-
-def channels_CRSF_to_packet(channels) -> bytes:
-    result = bytearray([
-        CRSF_SYNC, PACKET_LENGTH, PacketsTypes.RC_CHANNELS_PACKED
-    ])
-    result += pack_CRSF_to_bytes(channels)
-    result.append(crc8_data(result[2:]))
-    
-    return result
-
-
-def handle_CRSF_packet(ptype, data):
-    match ptype:
-        case PacketsTypes.RADIO_ID:
-            if data[5] == 0x10:
-                # print(f"OTX sync")
-                pass
-
-        case PacketsTypes.LINK_STATISTICS:
-            rssi1 = signed_byte(data[3])
-            rssi2 = signed_byte(data[4])
-            lq = data[5]
-            snr = signed_byte(data[6])
-            antenna = data[7]
-            mode = data[8]
-            power = data[9]
-
-            # Telemetry strength.
-            downlink_rssi = signed_byte(data[10])
-            downlink_lq = data[11]
-            downlink_snr = signed_byte(data[12])
-            print(
-                f"RSSI={rssi1}/{rssi2}dBm LQ={lq:03} mode={mode} "
-                f"ant={antenna} snr={snr} power={power} drssi={downlink_rssi} "
-                f"dlq={downlink_lq} dsnr={downlink_snr}"
-            )
-        
-        case PacketsTypes.ATTITUDE:
-            pitch = int.from_bytes(data[3:5], byteorder="big", signed=True) / 10000.0
-            roll = int.from_bytes(data[5:7], byteorder="big", signed=True) / 10000.0
-            yaw = int.from_bytes(data[7:9], byteorder="big", signed=True) / 10000.0
-            print(f"Attitude: Pitch={pitch:0.2f} Roll={roll:0.2f} Yaw={yaw:0.2f} (rad)")
-
-        case PacketsTypes.FLIGHT_MODE:
-            packet = "".join(map(chr, data[3:-2]))
-            print(f"Flight Mode: {packet}")
-
-        case PacketsTypes.BATTERY_SENSOR:
-            vbat = int.from_bytes(data[3:5], byteorder="big", signed=True) / 10.0
-            curr = int.from_bytes(data[5:7], byteorder="big", signed=True) / 10.0
-            mah = data[7] << 16 | data[8] << 7 | data[9]
-            pct = data[10]
-            print(f"Battery: {vbat:0.2f}V {curr:0.1f}A {mah}mAh {pct}%")
-
-        case PacketsTypes.BARO_ALT:
-            print(f"BaroAlt: ")
-
-        case PacketsTypes.DEVICE_INFO:
-            packet = " ".join(map(hex, data))
-            print(f"Device Info: {packet}")
-
-        case PacketsTypes.VARIO:
-            vspd = int.from_bytes(data[3:5], byteorder="big", signed=True) / 10.0
-            print(f"VSpd: {vspd:0.1f}m/s")
-        
-        case PacketsTypes.RC_CHANNELS_PACKED:
-            # print(f"Channels: (data)")
+async def write_channels(ser: aioserial.AioSerial):
+    ch0 = CHANNEL_CENTER
+    ch1 = CHANNEL_CENTER
+    while True:
+        try:
+            data = queue_uart.get_nowait()
+            ch0 = data["ch0"]
+            ch1 = data["ch1"]
+        except asyncio.QueueEmpty:
             pass
-        
-        case _:
-            packet = " ".join(map(hex, data))
-            print(f"Unknown 0x{ptype:02x}: {packet}")
+
+        channels = [
+            ch0, ch1, 992, 992, 992, 992, 992, 992, 
+            992, 992, 992, 992, 992, 992, 992, 992
+        ]
+
+        await ser.write_async(channels_CRSF_to_packet(channels))
 
 
-def main():
-    with serial.Serial(COMPORT, BAUDRATE, timeout=2) as ser:
-        ch0 = [992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
-        ch1 = [992, 1100, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
-        ch2 = [1200, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
-        ch3 = [800, 800, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992, 992]
+async def read_joystick():
+    axis_states = {}
+    axis_map = []
 
-        input = bytearray()
-        timer = 0
-        state = 0
-        ch = ch0
+    async with aiofiles.open(JOYSTICK_PATH, "rb") as jsdev:
 
-        ser.write(channels_CRSF_to_packet(ch0))
+        buf = array.array("B", [0] * 64)
+        ioctl(jsdev, 0x80006a13 + (0x10000 * len(buf)), buf)
 
+        # Get number of axes and buttons.
+        buf = array.array("B", [0])
+        ioctl(jsdev, 0x80016a11, buf) # JSIOCGAXES
+        num_axes = buf[0]
+
+        # Get the axis map.
+        buf = array.array("B", [0] * 0x40)
+        ioctl(jsdev, 0x80406a32, buf) # JSIOCGAXMAP
+
+        for axis in buf[:num_axes]:
+            axis_name = axis_names.get(axis, f"unknown(0x{axis:02x}")
+            axis_map.append(axis_name)
+            axis_states[axis_name] = 0.0
+
+        ret = {"ch0": CHANNEL_CENTER, "ch1": CHANNEL_CENTER}
         while True:
-            if ser.in_waiting > 0:
-                input.extend(ser.read(ser.in_waiting))
+            evbuf = await jsdev.read(8)
+            if evbuf:
+                time, value, type, number = struct.unpack("IhBB", evbuf)
+
+                if type & 0x02:
+                    axis = axis_map[number]
+                    if axis:
+                        axis_states[axis] = value
+                        
+                        gas = map_range(
+                            axis_states["gas"], 
+                            AXIS_MIN, 
+                            AXIS_MAX,
+                            CHANNEL_CENTER,
+                            CHANNEL_MAX
+                        )
+                        brake = map_range(
+                            axis_states["brake"], 
+                            AXIS_MIN, 
+                            AXIS_MAX,
+                            CHANNEL_CENTER + 1,
+                            CHANNEL_MIN
+                        )
+                        steering = map_range(
+                            axis_states["x"], 
+                            AXIS_MIN, 
+                            AXIS_MAX,
+                            CHANNEL_MIN,
+                            CHANNEL_MAX
+                        )
+                        gas_brake = brake if gas == CHANNEL_CENTER else gas
+                        
+                        ret = {
+                            "ch0": gas_brake,
+                            "ch1": steering,
+                        }
+
+                if queue_screen.full():
+                    await queue_screen.get()
+                else:
+                    await queue_screen.put(ret)              
+                
+                try:
+                    await queue_uart.put(ret)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for startup and shutdown events.
+    """
+    try:
+        ser = aioserial.AioSerial(COMPORT, BAUDRATE)
+        asyncio.gather(
+            read_joystick(),
+            write_channels(ser)
+        )
+
+        yield
+    except asyncio.exceptions.CancelledError as error:
+        print(error.args)
+    finally:
+        await camera.release()
+        print("Camera resource released.")
+
+app = FastAPI(lifespan=lifespan)
+
+
+class Camera:
+    """
+    A class to handle video capture from a camera.
+    """
+
+    def __init__(self, url: str | int = 0) -> None:
+        """
+        Initialize the camera.
+
+        :param camera_index: Index of the camera to use.
+        """
+        self.cap = cv2.VideoCapture(url)
+        self.lock = asyncio.Lock()
+        self.channels = {"ch0": CHANNEL_CENTER, "ch1": CHANNEL_CENTER}
+
+    async def get_frame(self) -> bytes:
+        """
+        Capture a frame from the camera.
+
+        :return: JPEG encoded image bytes.
+        """
+        async with self.lock:
+
+            ret, frame = self.cap.read()
+            if not ret:
+                return b""
+            
+            #  Detection and output.
+            results = model(frame, stream=True, verbose=False)
+
+            #  Coordinates.
+            for r in results:
+                boxes = r.boxes
+
+                for box in boxes:
+                    #  Bounding box.
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2) 
+
+                    # put box in cam
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 3)
+
+                    # class name
+                    cls = int(box.cls[0])
+
+                    # object details
+                    cv2.putText(
+                        frame, 
+                        class_names[cls], 
+                        [x1, y1], 
+                        FONT, 
+                        FONT_SCALE, 
+                        COLOR, 
+                        THICKNESS
+                    )
+            
+            #  Show channals status.
+            if not queue_screen.empty():
+                self.channels = await queue_screen.get()
+            
+            cv2.putText(
+                frame, 
+                f"gas/brake: {self.channels["ch0"]}; steering: {self.channels["ch1"]}",
+                [10, 40], 
+                FONT, 
+                FONT_SCALE, 
+                COLOR, 
+                THICKNESS
+            )
+
+            ret, jpeg = cv2.imencode(".jpg", frame)
+            if not ret:
+                return b""
+
+            return jpeg.tobytes()
+
+    async def release(self) -> None:
+        """
+        Release the camera resource.
+        """
+        async with self.lock:
+            if self.cap.isOpened():
+                self.cap.release()
+
+
+async def gen_frames() -> AsyncGenerator[bytes, None]:
+    """
+    An asynchronous generator function that yields camera frames.
+
+    :yield: JPEG encoded image bytes.
+    """
+    try:
+        while True:
+            frame = await camera.get_frame()
+            if frame:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                )
             else:
-                # Sending CHANNELS_PACKED every 20ms (all channels 1500us).
-                # ser.write(
-                #     channels_CRSF_to_packet([992 for ch in range(CHANNELS_NUM)])
-                # )
+                break
+            await asyncio.sleep(0.01)
+    except (asyncio.CancelledError, GeneratorExit):
+        print("Frame generation cancelled.")
+    finally:
+        print("Frame generator exited.")
 
-                ser.write(channels_CRSF_to_packet(ch))
 
-                if state == 0:
-                    if timer == 30:
-                        ch = ch1
-                        timer = 0
-                        state = 1
-                    timer += 1
-                if state == 1:
-                    if timer == 1000:
-                        ch = ch2
-                        timer = 0
-                        state = 2
-                    timer += 1
-                # if state == 1:
-                #     if not timer % 500:
-                #         ser.write(channels_CRSF_to_packet(ch2))
-                #         timer = 0
-                #         state = 2
-                #     else:
-                #         timer += 1
-                # if state == 2:
-                #     if not timer % 1000:
-                #         ser.write(channels_CRSF_to_packet(ch3))
-                #         timer = 0
-                #         state = 0
-                #     else:
-                #         timer += 1
-                # time.sleep(10)
-                # time.sleep(20)
-                # ser.write(channels_CRSF_to_packet(ch2))
-                # time.sleep(10)
-                # ser.write(channels_CRSF_to_packet(ch3))
-                # time.sleep(20)
-                time.sleep(0.020)
+@app.get("/video")
+async def video_feed() -> StreamingResponse:
+    """
+    Video streaming route.
 
-            if len(input) > 2:
-                # This simple parser works with malformed CRSF streams
-                # it does not check the first byte for SYNC_BYTE, but
-                # instead just looks for anything where the packet length
-                # is 4-64 bytes, and the CRC validates.
-                expected_len = input[1] + 2
-                if expected_len > 64 or expected_len < 4:
-                    input = []
-                elif len(input) >= expected_len:
-                    single = input[:expected_len] # copy out this whole packet
-                    input = input[expected_len:] # and remove it from the buffer
+    :return: StreamingResponse with multipart JPEG frames.
+    """
+    return StreamingResponse(
+        gen_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
-                    if not crsf_validate_frame(single): # single[-1] != crc:
-                        packet = " ".join(map(hex, single))
-                        print(f"crc error: {packet}")
-                    else:
-                        handle_CRSF_packet(single[2], single)
+
+async def main():
+    """
+    Main entry point to run the Uvicorn server.
+    """
+
+    config = uvicorn.Config(app, HOST, PORT)
+    server = uvicorn.Server(config)
+
+    # Run the server
+    await server.serve()
+    
 
 if __name__ == "__main__":
-    main()
+    try:
+        camera = Camera(0)
+        asyncio.run(main())
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        print("Server stopped by user.")

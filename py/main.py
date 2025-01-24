@@ -151,27 +151,27 @@ async def read_joystick():
                             AXIS_MIN, 
                             AXIS_MAX,
                             CHANNEL_CENTER,
-                            CHANNEL_MAX
+                            CHANNEL_MAX - 800
                         )
                         brake = map_range(
                             axis_states["brake"], 
                             AXIS_MIN, 
                             AXIS_MAX,
-                            CHANNEL_CENTER + 1,
-                            CHANNEL_MIN
+                            CHANNEL_CENTER + 20,
+                            CHANNEL_MIN + 770
                         )
                         steering = map_range(
                             axis_states["x"], 
                             AXIS_MIN, 
                             AXIS_MAX,
-                            CHANNEL_MIN,
-                            CHANNEL_MAX
+                            CHANNEL_MAX - 750,
+                            CHANNEL_MIN + 750
                         )
                         gas_brake = brake if gas == CHANNEL_CENTER else gas
                         
                         ret = {
-                            "ch0": gas_brake,
-                            "ch1": steering,
+                            "ch0": steering,
+                            "ch1": gas_brake,
                         }
 
                 if queue_screen.full():
@@ -269,7 +269,7 @@ class Camera:
             
             cv2.putText(
                 frame, 
-                f"gas/brake: {self.channels["ch0"]}; steering: {self.channels["ch1"]}",
+                f"gas/brake: {self.channels["ch1"]}; steering: {self.channels["ch0"]}",
                 [10, 40], 
                 FONT, 
                 FONT_SCALE, 
@@ -342,7 +342,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        camera = Camera(0)
+        camera = Camera(2)
         asyncio.run(main())
     except (asyncio.CancelledError, KeyboardInterrupt):
         print("Server stopped by user.")
